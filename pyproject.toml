@@ -179,6 +179,14 @@ oracle = [
   "pandas>=1.5.3,<3",
   "rich>=12.4.4",
 ]
+oxla = [
+  "psycopg[binary]>=3.2.0",
+  "pyarrow>=10.0.1",
+  "pyarrow-hotfix>=0.4",
+  "numpy>=1.23.2,<3",
+  "pandas>=1.5.3,<3",
+  "rich>=12.4.4",
+]
 polars = [
   "polars>=1",
   "packaging>=21.3",
@@ -320,6 +328,7 @@ impala = "ibis.backends.impala"
 mysql = "ibis.backends.mysql"
 mssql = "ibis.backends.mssql"
 oracle = "ibis.backends.oracle"
+oxla = "ibis.backends.oxla"
 polars = "ibis.backends.polars"
 postgres = "ibis.backends.postgres"
 risingwave = "ibis.backends.risingwave"
