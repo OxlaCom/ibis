@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import inspect
-import warnings
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote_plus
@@ -12,7 +11,6 @@ from urllib.parse import unquote_plus
 import psycopg
 import sqlglot as sg
 import sqlglot.expressions as sge
-from pandas.api.types import is_float_dtype
 
 import ibis
 import ibis.backends.sql.compilers as sc
