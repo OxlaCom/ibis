@@ -42,7 +42,7 @@ class NatDumper(psycopg.adapt.Dumper):
         return None
 
 
-class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoader):
+class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoader):
     name = "oxla"
     compiler = sc.oxla.compiler
     supports_python_udfs = True
@@ -68,8 +68,6 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
             "user": url.username,
             "password": unquote_plus(url.password or ""),
             "host": url.hostname,
-            "database": database or "",
-            "schema": schema[0] if schema else "",
             "port": url.port,
         }
 
@@ -82,12 +80,6 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         if "host" in kwargs and not kwargs["host"]:
             del kwargs["host"]
 
-        if "database" in kwargs and not kwargs["database"]:
-            del kwargs["database"]
-
-        if "schema" in kwargs and not kwargs["schema"]:
-            del kwargs["schema"]
-
         if "password" in kwargs and kwargs["password"] is None:
             del kwargs["password"]
 
@@ -97,57 +89,17 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         return self.connect(**kwargs)
 
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
-        schema = op.schema
-        if null_columns := schema.null_fields:
-            raise exc.IbisTypeError(
-                f"{self.name} cannot yet reliably handle `null` typed columns; "
-                f"got null typed columns: {null_columns}"
-            )
+        """No-op."""
 
-        name = op.name
-        quoted = self.compiler.quoted
-        create_stmt = sg.exp.Create(
-            kind="TABLE",
-            this=sg.exp.Schema(
-                this=sg.to_identifier(name, quoted=quoted),
-                expressions=schema.to_sqlglot(self.dialect),
-            ),
-            properties=sg.exp.Properties(expressions=[sge.TemporaryProperty()]),
-        )
-        create_stmt_sql = create_stmt.sql(self.dialect)
-
-        df = op.data.to_frame()
-        # nan gets compiled into 'NaN'::float which throws errors in non-float columns
-        # In order to hold NaN values, pandas automatically converts integer columns
-        # to float columns if there are NaN values in them. Therefore, we need to convert
-        # them to their original dtypes (that support pd.NA) to figure out which columns
-        # are actually non-float, then fill the NaN values in those columns with None.
-        convert_df = df.convert_dtypes()
-        for col in convert_df.columns:
-            if not is_float_dtype(convert_df[col]):
-                df[col] = df[col].replace(float("nan"), None)
-
-        data = df.itertuples(index=False)
-        sql = self._build_insert_template(
-            name, schema=schema, columns=True, placeholder="%s"
-        )
-
-        con = self.con
-        with con.cursor() as cursor, con.transaction():
-            cursor.execute(create_stmt_sql)
-            cursor.executemany(sql, data)
-
-    @contextlib.contextmanager
-    def begin(self):
-        with (con := self.con).cursor() as cursor, con.transaction():
-            yield cursor
+    def _finalize_memtable(self, name: str) -> None:
+        """No-op."""
 
     def _fetch_from_cursor(
         self, cursor: psycopg.Cursor, schema: sch.Schema
     ) -> pd.DataFrame:
         import pandas as pd
 
-        from ibis.backends.postgres.converter import PostgresPandasData
+        from ibis.formats.pandas import PandasData
 
         try:
             df = pd.DataFrame.from_records(
@@ -160,7 +112,7 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
             # artificially locked tables
             cursor.close()
             raise
-        df = PostgresPandasData.convert_table(df, schema)
+        df = PandasData.convert_table(df, schema)
         return df
 
     @property
@@ -181,12 +133,9 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         user: str | None = None,
         password: str | None = None,
         port: int = 5432,
-        database: str | None = None,
-        schema: str | None = None,
-        autocommit: bool = True,
         **kwargs: Any,
     ) -> None:
-        """Create an Ibis client connected to PostgreSQL database.
+        """Create an Ibis client connected to Oxla database.
 
         Parameters
         ----------
@@ -198,42 +147,8 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
             Password
         port
             Port number
-        database
-            Database to connect to
-        schema
-            PostgreSQL schema to use. If `None`, use the default `search_path`.
-        autocommit
-            Whether or not to autocommit
         kwargs
             Additional keyword arguments to pass to the backend client connection.
-
-        Examples
-        --------
-        >>> import os
-        >>> import ibis
-        >>> host = os.environ.get("IBIS_TEST_POSTGRES_HOST", "localhost")
-        >>> user = os.environ.get("IBIS_TEST_POSTGRES_USER", "postgres")
-        >>> password = os.environ.get("IBIS_TEST_POSTGRES_PASSWORD", "postgres")
-        >>> database = os.environ.get("IBIS_TEST_POSTGRES_DATABASE", "ibis_testing")
-        >>> con = ibis.postgres.connect(database=database, host=host, user=user, password=password)
-        >>> con.list_tables()  # doctest: +ELLIPSIS
-        [...]
-        >>> t = con.table("functional_alltypes")
-        >>> t
-        DatabaseTable: functional_alltypes
-          id              int32
-          bool_col        boolean
-          tinyint_col     int16
-          smallint_col    int16
-          int_col         int32
-          bigint_col      int64
-          float_col       float32
-          double_col      float64
-          date_string_col string
-          string_col      string
-          timestamp_col   timestamp(6)
-          year            int32
-          month           int32
         """
         import pandas as pd
         import psycopg
@@ -246,8 +161,7 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
             port=port,
             user=user,
             password=password,
-            dbname=database,
-            autocommit=autocommit,
+            autocommit=True,
             **kwargs,
         )
 
@@ -256,12 +170,12 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
     @util.experimental
     @classmethod
     def from_connection(cls, con: psycopg.Connection, /) -> Backend:
-        """Create an Ibis client from an existing connection to a PostgreSQL database.
+        """Create an Ibis client from an existing connection to an Oxla database.
 
         Parameters
         ----------
         con
-            An existing connection to a PostgreSQL database.
+            An existing connection to an Oxla database.
         """
         new_backend = cls()
         new_backend._can_reconnect = False
@@ -269,20 +183,9 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         return new_backend
 
     def list_tables(
-        self, *, like: str | None = None, database: tuple[str, str] | str | None = None
+        self, *, like: str | None = None, database: str | None = None
     ) -> list[str]:
-        """List the tables in the database.
-
-        ::: {.callout-note}
-        ## Ibis does not use the word `schema` to refer to database hierarchy.
-
-        A collection of tables is referred to as a `database`.
-        A collection of `database` is referred to as a `catalog`.
-
-        These terms are mapped onto the corresponding features in each
-        backend (where available), regardless of whether the backend itself
-        uses the same terminology.
-        :::
+        """List the tables in `database` matching the pattern `like`.
 
         Parameters
         ----------
@@ -291,6 +194,12 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         database
             Database to list tables from. Default behavior is to show tables in
             the current database.
+
+        Returns
+        -------
+        list[str]
+            List of table names in `database` matching the optional pattern
+            `like`.
         """
 
         if database is not None:
@@ -304,11 +213,11 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
 
         if (db := table_loc.args["db"]) is not None:
             db.args["quoted"] = False
-            db = db.sql(dialect=self.name)
+            db = db.sql(dialect=self.dialect)
             conditions.append(C.table_schema.eq(sge.convert(db)))
         if (catalog := table_loc.args["catalog"]) is not None:
             catalog.args["quoted"] = False
-            catalog = catalog.sql(dialect=self.name)
+            catalog = catalog.sql(dialect=self.dialect)
             conditions.append(C.table_catalog.eq(sge.convert(catalog)))
 
         sql = (
@@ -323,34 +232,9 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         with con.cursor() as cursor, con.transaction():
             out = cursor.execute(sql).fetchall()
 
-        # Include temporary tables only if no database has been explicitly specified
-        # to avoid temp tables showing up in all calls to `list_tables`
-        if db == "public":
-            out += self._fetch_temp_tables()
-
         return self._filter_with_like(map(itemgetter(0), out), like)
 
-    def _fetch_temp_tables(self):
-        # postgres temporary tables are stored in a separate schema
-        # so we need to independently grab them and return them along with
-        # the existing results
-
-        sql = (
-            sg.select("table_name")
-            .from_(sg.table("tables", db="information_schema"))
-            .distinct()
-            .where(C.table_type.eq(sge.convert("LOCAL TEMPORARY")))
-            .sql(self.dialect)
-        )
-
-        con = self.con
-        with con.cursor() as cursor, con.transaction():
-            out = cursor.execute(sql).fetchall()
-
-        return out
-
     def list_catalogs(self, *, like: str | None = None) -> list[str]:
-        # http://dba.stackexchange.com/a/1304/58517
         cats = (
             sg.select(C.datname)
             .from_(sg.table("pg_database", db="pg_catalog"))
@@ -367,8 +251,8 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         self, *, like: str | None = None, catalog: str | None = None
     ) -> list[str]:
         dbs = (
-            sg.select(C.schema_name)
-            .from_(sg.table("schemata", db="information_schema"))
+            sg.select(C.nspname)
+            .from_(sg.table("pg_namespace", db="pg_catalog"))
             .sql(self.dialect)
         )
         con = self.con
@@ -517,28 +401,9 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         )
 
     def _get_schema_using_query(self, query: str) -> sch.Schema:
-        name = util.gen_name(f"{self.name}_metadata")
-
-        create_stmt = sge.Create(
-            kind="VIEW",
-            this=sg.table(name),
-            expression=sg.parse_one(query, read=self.dialect),
-            properties=sge.Properties(expressions=[sge.TemporaryProperty()]),
-        ).sql(self.dialect)
-
-        drop_stmt = sge.Drop(kind="VIEW", this=sg.table(name), exists=True).sql(
-            self.dialect
+        raise com.UnsupportedOperationError(
+            "Oxla does not support views"
         )
-
-        con = self.con
-        with con.cursor() as cursor, con.transaction():
-            cursor.execute(create_stmt)
-
-        try:
-            return self.get_schema(name)
-        finally:
-            with con.cursor() as cursor, con.transaction():
-                cursor.execute(drop_stmt)
 
     def create_database(
         self, name: str, /, *, catalog: str | None = None, force: bool = False
@@ -592,10 +457,9 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         *,
         schema: sch.SchemaLike | None = None,
         database: str | None = None,
-        temp: bool = False,
         overwrite: bool = False,
     ):
-        """Create a table in Postgres.
+        """Create a table in Oxla.
 
         Parameters
         ----------
@@ -610,8 +474,6 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
         database
             The name of the database in which to create the table; if not
             passed, the current database is used.
-        temp
-            Create a temporary table
         overwrite
             If `True`, replace the table if it already exists, otherwise fail
             if the table exists
@@ -622,9 +484,6 @@ class Backend(SQLBackend, CanListCatalog, CanCreateDatabase, PyArrowExampleLoade
             schema = ibis.schema(schema)
 
         properties = []
-
-        if temp:
-            properties.append(sge.TemporaryProperty())
 
         if obj is not None:
             if not isinstance(obj, ir.Expr):
