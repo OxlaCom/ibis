@@ -13,13 +13,11 @@ import sqlglot.expressions as sge
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.rules as rlz
 from ibis.backends.sql.compilers.base import NULL, STAR, AggGen, SQLGlotCompiler
 from ibis.backends.sql.datatypes import PostgresType
 from ibis.backends.sql.dialects import Postgres
 from ibis.backends.sql.rewrites import (
     lower_sample,
-    split_select_distinct_with_order_by,
     subtract_one_from_array_map_filter_index,
 )
 from ibis.common.exceptions import InvalidDecoratorError
@@ -37,17 +35,12 @@ def _verify_source_line(func_name: str, line: str):
     return line
 
 
-class PostgresUDFNode(ops.Value):
-    shape = rlz.shape_like("args")
-
-
 class OxlaCompiler(SQLGlotCompiler):
     __slots__ = ()
 
     dialect = Postgres
     type_mapper = PostgresType
     rewrites = (subtract_one_from_array_map_filter_index, *SQLGlotCompiler.rewrites)
-    post_rewrites = (split_select_distinct_with_order_by,)
 
     agg = AggGen(supports_filter=True, supports_order_by=True)
 
@@ -64,78 +57,31 @@ class OxlaCompiler(SQLGlotCompiler):
     )
 
     SIMPLE_OPS = {
-        ops.Arbitrary: "first",  # could use any_value for postgres>=16
+        ops.Arbitrary: "any_value",
+        ops.ArrayMin: "list_min",
+        ops.ArrayMax: "list_max",
+        ops.ArrayAny: "list_bool_or",
+        ops.ArrayAll: "list_bool_and",
+        ops.ArraySum: "list_sum",
+        ops.ArrayMean: "list_avg",
+        ops.ArrayMode: "list_mode",
         ops.ArrayRemove: "array_remove",
         ops.BitAnd: "bit_and",
         ops.BitOr: "bit_or",
         ops.BitXor: "bit_xor",
-        ops.GeoArea: "st_area",
-        ops.GeoAsBinary: "st_asbinary",
-        ops.GeoAsEWKB: "st_asewkb",
-        ops.GeoAsEWKT: "st_asewkt",
-        ops.GeoAsText: "st_astext",
-        ops.GeoAzimuth: "st_azimuth",
-        ops.GeoBuffer: "st_buffer",
-        ops.GeoCentroid: "st_centroid",
-        ops.GeoContains: "st_contains",
-        ops.GeoContainsProperly: "st_contains",
-        ops.GeoCoveredBy: "st_coveredby",
-        ops.GeoCovers: "st_covers",
-        ops.GeoCrosses: "st_crosses",
-        ops.GeoDFullyWithin: "st_dfullywithin",
-        ops.GeoDWithin: "st_dwithin",
-        ops.GeoDifference: "st_difference",
-        ops.GeoDisjoint: "st_disjoint",
-        ops.GeoDistance: "st_distance",
-        ops.GeoEndPoint: "st_endpoint",
-        ops.GeoEnvelope: "st_envelope",
-        ops.GeoEquals: "st_equals",
-        ops.GeoGeometryN: "st_geometryn",
-        ops.GeoGeometryType: "st_geometrytype",
-        ops.GeoIntersection: "st_intersection",
-        ops.GeoIntersects: "st_intersects",
-        ops.GeoIsValid: "st_isvalid",
-        ops.GeoLength: "st_length",
-        ops.GeoLineLocatePoint: "st_linelocatepoint",
-        ops.GeoLineMerge: "st_linemerge",
-        ops.GeoLineSubstring: "st_linesubstring",
-        ops.GeoNPoints: "st_npoints",
-        ops.GeoOrderingEquals: "st_orderingequals",
-        ops.GeoOverlaps: "st_overlaps",
-        ops.GeoPerimeter: "st_perimeter",
-        ops.GeoSRID: "st_srid",
-        ops.GeoSetSRID: "st_setsrid",
-        ops.GeoSimplify: "st_simplify",
-        ops.GeoStartPoint: "st_startpoint",
-        ops.GeoTouches: "st_touches",
-        ops.GeoTransform: "st_transform",
-        ops.GeoUnaryUnion: "st_union",
-        ops.GeoUnion: "st_union",
-        ops.GeoWithin: "st_within",
-        ops.GeoX: "st_x",
-        ops.GeoY: "st_y",
         ops.MapContains: "exist",
         ops.MapKeys: "akeys",
         ops.MapValues: "avals",
         ops.RegexSearch: "regexp_like",
         ops.TimeFromHMS: "make_time",
         ops.RandomUUID: "gen_random_uuid",
+        ops.EndsWith: "suffix",
+        ops.RandomScalar: "random",
+        ops.ExtractIsoYear: "isoyear",
+        ops.IntegerRange: "range",
+        ops.TimestampRange: "range",
+        ops.MapLength: "cardinality",
     }
-
-    def to_sqlglot(
-        self,
-        expr: ir.Expr,
-        *,
-        limit: str | None = None,
-        params: Mapping[ir.Expr, Any] | None = None,
-    ):
-        table_expr = expr.as_table()
-        geocols = table_expr.schema().geospatial
-        conversions = {name: table_expr[name].as_ewkb() for name in geocols}
-
-        if conversions:
-            table_expr = table_expr.mutate(**conversions)
-        return super().to_sqlglot(table_expr, limit=limit, params=params)
 
     def _compile_python_udf(self, udf_node: ops.ScalarUDF):
         config = udf_node.__config__

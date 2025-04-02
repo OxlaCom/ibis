@@ -11,6 +11,8 @@ from urllib.parse import unquote_plus
 import psycopg
 import sqlglot as sg
 import sqlglot.expressions as sge
+import toolz
+from pandas.api.types import is_float_dtype
 
 import ibis
 import ibis.backends.sql.compilers as sc
@@ -38,7 +40,6 @@ if TYPE_CHECKING:
 class NatDumper(psycopg.adapt.Dumper):
     def dump(self, obj, context: Any | None = None) -> str | None:
         return None
-
 
 class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoader):
     name = "oxla"
@@ -87,10 +88,55 @@ class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoade
         return self.connect(**kwargs)
 
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
-        """No-op."""
+        print("register in memory table")
+        schema = op.schema
+        if null_columns := schema.null_fields:
+            raise exc.IbisTypeError(
+                f"{self.name} cannot yet reliably handle `null` typed columns; "
+                f"got null typed columns: {null_columns}"
+            )
+
+        name = op.name
+        quoted = self.compiler.quoted
+        create_stmt = sg.exp.Create(
+            kind="TABLE",
+            this=sg.exp.Schema(
+                this=sg.to_identifier(name, quoted=quoted),
+                expressions=schema.to_sqlglot(self.dialect),
+            ),
+        )
+        create_stmt_sql = create_stmt.sql(self.dialect)
+
+        df = op.data.to_frame()
+        # nan gets compiled into 'NaN'::float which throws errors in non-float columns
+        # In order to hold NaN values, pandas automatically converts integer columns
+        # to float columns if there are NaN values in them. Therefore, we need to convert
+        # them to their original dtypes (that support pd.NA) to figure out which columns
+        # are actually non-float, then fill the NaN values in those columns with None.
+        convert_df = df.convert_dtypes()
+        for col in convert_df.columns:
+            if not is_float_dtype(convert_df[col]):
+                df[col] = df[col].replace(float("nan"), None)
+
+        data = df.itertuples(index=False)
+        sql = self._build_insert_template(
+            name, schema=schema, columns=True, placeholder="%s"
+        )
+
+        dsn_params =  self.con.info.get_parameters()
+        new_con = psycopg.connect(
+            host=dsn_params['host'],
+            user=dsn_params['user'],
+            password=self.con.info.password,
+            dbname=dsn_params['dbname'])
+        with new_con.cursor() as cursor:
+            cursor.execute(create_stmt_sql)
+            print(create_stmt_sql)
+            cursor.executemany(sql, data)
+            print("execute many")
 
     def _finalize_memtable(self, name: str) -> None:
-        """No-op."""
+        self.drop_table(name, force=True)
 
     def _fetch_from_cursor(
         self, cursor: psycopg.Cursor, schema: sch.Schema
@@ -455,6 +501,7 @@ class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoade
         *,
         schema: sch.SchemaLike | None = None,
         database: str | None = None,
+        temp: bool = False,
         overwrite: bool = False,
     ):
         """Create a table in Oxla.
@@ -472,6 +519,9 @@ class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoade
         database
             The name of the database in which to create the table; if not
             passed, the current database is used.
+        temp
+            This parameter is not yet supported in the Amazon Athena backend, because
+            Amazon Athena doesn't implement temporary tables
         overwrite
             If `True`, replace the table if it already exists, otherwise fail
             if the table exists
@@ -480,6 +530,11 @@ class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoade
             raise ValueError("Either `obj` or `schema` must be specified")
         if schema is not None:
             schema = ibis.schema(schema)
+
+        if temp:
+            raise NotImplementedError(
+                "Temporary tables are not supported in the Amazon Athena backend"
+            )
 
         properties = []
 
@@ -494,19 +549,13 @@ class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoade
             query = self.compiler.to_sqlglot(table)
         else:
             query = None
-
-        if overwrite:
-            temp_name = util.gen_name(f"{self.name}_table")
-        else:
-            temp_name = name
-
+        
         if not schema:
             schema = table.schema()
 
         quoted = self.compiler.quoted
         dialect = self.dialect
-
-        table_expr = sg.table(temp_name, db=database, quoted=quoted)
+        table_expr = sg.table(name, db=database, quoted=quoted)
         target = sge.Schema(this=table_expr, expressions=schema.to_sqlglot(dialect))
 
         create_stmt = sge.Create(
@@ -516,23 +565,22 @@ class Backend(SQLBackend, CanCreateDatabase, CanListCatalog, PyArrowExampleLoade
         ).sql(dialect)
 
         this = sg.table(name, catalog=database, quoted=quoted)
-        this_no_catalog = sg.table(name, quoted=quoted)
 
         con = self.con
-        with con.cursor() as cursor, con.transaction():
+        with con.cursor() as cursor:
+            if overwrite:
+                cursor.execute(
+                    sge.Drop(kind="TABLE", this=this, exists=True).sql(dialect)
+                )
+
+            print("create table")
+            print(create_stmt)
             cursor.execute(create_stmt)
 
             if query is not None:
                 insert_stmt = sge.Insert(this=table_expr, expression=query).sql(dialect)
                 cursor.execute(insert_stmt)
-
-            if overwrite:
-                cursor.execute(
-                    sge.Drop(kind="TABLE", this=this, exists=True).sql(dialect)
-                )
-                cursor.execute(
-                    f"ALTER TABLE IF EXISTS {table_expr.sql(dialect)} RENAME TO {this_no_catalog.sql(dialect)}"
-                )
+                print("insert into table")
 
         if schema is None:
             return self.table(name, database=database)
